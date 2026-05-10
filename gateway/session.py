@@ -1115,6 +1115,13 @@ class SessionStore:
                 if not self.should_suspend_on_startup(entry):
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
+                    # Sparrow intent (#7536): hard-suspend so user must
+                    # explicitly resume after a crash, not silently auto-resume.
+                    # Upstream changed semantics to soft auto-resume via
+                    # resume_pending; we set BOTH so upstream consumers of the
+                    # new fields keep working AND the suspended block holds
+                    # (suspended is checked before resume_pending downstream).
+                    entry.suspended = True
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
