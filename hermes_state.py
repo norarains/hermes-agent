@@ -1593,6 +1593,50 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def get_last_assistant_content(self, session_id: str) -> Optional[str]:
+        """Return the ``content`` of the most recently appended assistant
+        message for ``session_id``, or ``None`` if there is none.
+
+        Used by the post-send decoration path to verify that the entry
+        we're about to overwrite is the one we just persisted (no race,
+        no stale state) before mutating it.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return row[0]
+
+    def update_last_assistant_content(
+        self,
+        session_id: str,
+        new_content: str,
+    ) -> bool:
+        """Overwrite the ``content`` of the most recent assistant entry
+        for ``session_id``.  Returns True iff a row was updated.
+
+        Caller is expected to verify the prior content first via
+        ``get_last_assistant_content`` to avoid clobbering an entry from
+        a concurrent or out-of-order write.
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE messages SET content = ? "
+                "WHERE id = (SELECT id FROM messages "
+                "            WHERE session_id = ? AND role = 'assistant' "
+                "            ORDER BY id DESC LIMIT 1)",
+                (new_content, session_id),
+            )
+            return cur.rowcount > 0
+
+        return self._execute_write(_do)
+
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
         with self._lock:

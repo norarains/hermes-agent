@@ -295,6 +295,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Input behavior while agent is running",
         "options": ["interrupt", "queue", "steer"],
     },
+    "display.busy_ack": {
+        "type": "boolean",
+        "description": "Send a one-line acknowledgment when input arrives while agent is busy",
+    },
     "memory.provider": {
         "type": "select",
         "description": "Memory provider plugin",

@@ -748,6 +748,13 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     """
     Generate audio using Edge TTS.
 
+    Recognized config keys (under ``tts.edge``):
+      - ``voice`` (str)   — Edge voice short name, e.g. ``zh-CN-XiaoyiNeural``
+      - ``speed`` (float) — playback speed, 1.0 = native (mapped to ``rate``)
+      - ``pitch`` (str)   — pitch offset for ``edge_tts.Communicate``,
+                            e.g. ``"+5Hz"`` / ``"-3Hz"``.  Slight + values
+                            (``+5Hz``) make Chinese voices sound livelier
+                            without crossing into chipmunk territory.
     Args:
         text: Text to convert.
         output_path: Where to save the MP3 file.
@@ -760,11 +767,24 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     edge_config = tts_config.get("edge", {})
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
+    pitch_raw = edge_config.get("pitch")
 
     kwargs = {"voice": voice}
     if speed != 1.0:
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
+    if pitch_raw is not None:
+        pitch_str = str(pitch_raw).strip()
+        # Edge TTS expects exactly ``+NHz`` or ``-NHz``.  Validate so a
+        # config typo doesn't spew ssml-server errors at delivery time
+        # — a clear log + skip is friendlier than a 500 from MS.
+        if re.match(r"^[+-]\d+Hz$", pitch_str):
+            kwargs["pitch"] = pitch_str
+        else:
+            logger.warning(
+                "tts.edge.pitch=%r ignored: expected '+NHz' or '-NHz' "
+                "(e.g. '+5Hz')", pitch_raw,
+            )
 
     communicate = _edge_tts.Communicate(text, **kwargs)
     await communicate.save(output_path)

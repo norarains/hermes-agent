@@ -562,6 +562,128 @@ def _sanitize_surrogates(text: str) -> str:
 # (see import block above). Remains importable from run_agent for backward compat.
 
 
+def _summarize_model_response_for_event(response: Any) -> str:
+    """Compact textual preview of what the model emitted this iteration.
+
+    Used by the ``model_call_finished`` sparrow event so an operator
+    reading sparrow.log sees WHAT the model said in addition to token
+    counts.  Handles the four shapes that show up in practice:
+
+      1. **Text-only reply** (chat turn): just the prose.
+      2. **Tool-call-only turn** (no text content): rendered as
+         ``→ tool_name(arg=val, ...)`` for each call so the operator
+         can see the decision without scrolling to ``tool_call_starting``.
+      3. **Mixed text + tool call**: prose first, then tool-call lines.
+      4. **Reasoning-only response** (rare; reasoning models that emit
+         only thoughts before deciding): falls back to the reasoning
+         text so the line is never blank.
+
+    Provider response shapes covered:
+      * OpenAI: ``response.choices[0].message.{content,tool_calls,reasoning}``
+        where ``tool_calls[i].function.{name,arguments}`` carries the
+        call.  ``arguments`` is a JSON string.
+      * Anthropic: ``response.content`` is a list of blocks; text blocks
+        have ``.text``, tool_use blocks have ``.name`` + ``.input``.
+        Some adapters expose ``.content`` as a plain string for
+        text-only responses.
+
+    Failure to extract anything returns ``""`` so the caller can still
+    emit a well-formed event without bailing out the whole pipeline.
+    """
+    parts: List[str] = []
+
+    def _format_args(arg_value: Any) -> str:
+        """Render tool-call arguments compactly: ``key=val, key2=val2``.
+        Strings get quoted, other JSON-serializable values are inlined,
+        non-serializable values become ``<type>``.  Truncated per-arg to
+        keep one tool call from blowing past the 512-char preview cap."""
+        if arg_value is None:
+            return ""
+        if isinstance(arg_value, str):
+            # OpenAI passes args as a JSON string in `arguments`.
+            try:
+                arg_value = json.loads(arg_value)
+            except Exception:
+                return arg_value[:80]
+        if not isinstance(arg_value, dict):
+            return str(arg_value)[:80]
+        rendered = []
+        for k, v in arg_value.items():
+            if isinstance(v, str):
+                v_str = v[:60] + "…" if len(v) > 60 else v
+                rendered.append(f"{k}={v_str!r}")
+            else:
+                try:
+                    s = json.dumps(v, ensure_ascii=False)
+                except Exception:
+                    s = f"<{type(v).__name__}>"
+                if len(s) > 60:
+                    s = s[:60] + "…"
+                rendered.append(f"{k}={s}")
+        return ", ".join(rendered)
+
+    try:
+        # ── OpenAI shape ───────────────────────────────────────────
+        choices = getattr(response, "choices", None)
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                content = getattr(msg, "content", None)
+                if isinstance(content, str) and content.strip():
+                    parts.append(content)
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                for tc in tool_calls:
+                    fn = getattr(tc, "function", None)
+                    name = getattr(fn, "name", None) or "?"
+                    args = getattr(fn, "arguments", None)
+                    parts.append(f"→ {name}({_format_args(args)})")
+                if not parts:
+                    # Reasoning-only fallback: surface the chain-of-thought
+                    # so the line isn't blank for a model that emitted
+                    # only thoughts.
+                    rsn = (
+                        getattr(msg, "reasoning_content", None)
+                        or getattr(msg, "reasoning", None)
+                    )
+                    if isinstance(rsn, str) and rsn.strip():
+                        parts.append(f"[reasoning] {rsn}")
+
+        # ── Anthropic shape ────────────────────────────────────────
+        if not parts:
+            content = getattr(response, "content", None)
+            if isinstance(content, str) and content.strip():
+                parts.append(content)
+            elif isinstance(content, list):
+                for blk in content:
+                    btype = getattr(blk, "type", None) or (
+                        blk.get("type") if isinstance(blk, dict) else None
+                    )
+                    if btype == "text":
+                        text = getattr(blk, "text", None) or (
+                            blk.get("text") if isinstance(blk, dict) else None
+                        )
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text)
+                    elif btype == "tool_use":
+                        name = getattr(blk, "name", None) or (
+                            blk.get("name") if isinstance(blk, dict) else None
+                        ) or "?"
+                        inp = getattr(blk, "input", None) or (
+                            blk.get("input") if isinstance(blk, dict) else None
+                        )
+                        parts.append(f"→ {name}({_format_args(inp)})")
+                    elif btype == "thinking" and not parts:
+                        thinking = getattr(blk, "thinking", None) or (
+                            blk.get("thinking") if isinstance(blk, dict) else None
+                        )
+                        if isinstance(thinking, str) and thinking.strip():
+                            parts.append(f"[reasoning] {thinking}")
+    except Exception:
+        return ""
+
+    return "\n".join(p for p in parts if p)
+
+
 def _sanitize_structure_surrogates(payload: Any) -> bool:
     """Replace surrogate code points in nested dict/list payloads in-place.
 
@@ -3926,18 +4048,47 @@ class AIAgent:
                 )
 
                 if actions:
-                    summary = " · ".join(dict.fromkeys(actions))
-                    self._safe_print(
-                        f"  💾 Self-improvement review: {summary}"
-                    )
+                    # Translate each action against the per-kind
+                    # ``messaging.background_review.translations`` map
+                    # BEFORE joining.  The translation lookup is
+                    # whole-string exact match, so a joined multi-action
+                    # summary like "User profile updated · Memory
+                    # updated" would miss every per-segment dict entry.
+                    # Per-segment translation lets every segment land in
+                    # the operator's configured locale.
+                    try:
+                        from gateway.user_messages import translate_for_kind
+                        translated = [translate_for_kind("background_review", a) for a in actions]
+                    except Exception:
+                        translated = list(actions)
+                    summary = " · ".join(dict.fromkeys(translated))
                     _bg_cb = self.background_review_callback
-                    if _bg_cb:
+                    if _bg_cb is not None:
+                        # Gateway mode: a callback delivers the user-facing
+                        # message via the platform (e.g. QQ message), so we
+                        # MUST NOT also _safe_print to stdout — that
+                        # pollutes the gateway's terminal output, which
+                        # otherwise carries only structured log lines.
+                        # Route the audit trail to the logger instead so it
+                        # lands in ~/.hermes/logs/agent.log alongside other
+                        # gateway events.
+                        logger.info("background_review: %s", summary)
                         try:
-                            _bg_cb(
-                                f"💾 Self-improvement review: {summary}"
-                            )
+                            # Pass the RAW summary; the gateway callback
+                            # wraps it via the platform's
+                            # `render_user_message("background_review", ...)`
+                            # hook so the prefix / framing is platform-
+                            # and config-customizable instead of baked in
+                            # here.
+                            _bg_cb(summary)
                         except Exception:
                             pass
+                    else:
+                        # CLI mode: no delivery callback registered, so the
+                        # only way the user sees the review summary is
+                        # through prompt_toolkit's TUI renderer wired into
+                        # ``_print_fn``.  Keep the raw print here.
+                        self._safe_print(f"  💾 {summary}")
 
             except Exception as e:
                 logger.warning("Background memory/skill review failed: %s", e)
@@ -5162,12 +5313,13 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
+            # Persist the completed exchange.  Prefetch is NOT fired
+            # here anymore — it's fired at the START of each turn
+            # against THAT turn's query (run_conversation, near the
+            # beginning).  Firing here would queue against the prior
+            # turn's query and produce the cross-turn-lag mismatch.
             self._memory_manager.sync_all(
                 original_user_message, final_response,
-                session_id=self.session_id or "",
-            )
-            self._memory_manager.queue_prefetch_all(
-                original_user_message,
                 session_id=self.session_id or "",
             )
         except Exception:
@@ -5473,7 +5625,10 @@ class AIAgent:
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p %Z')}"
+        tz_name = getattr(now.tzinfo, "key", None)
+        if tz_name:
+            timestamp_line += f"\nTimezone: {tz_name}"
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
         if self.model:
@@ -7543,6 +7698,18 @@ class AIAgent:
                         ),
                     ))
 
+            # If the for-loop broke because the agent was interrupted,
+            # return None instead of constructing a mock response from
+            # the partial chunks.  Operator semantics: ``stop`` means
+            # "abandon this call, don't pretend it produced anything"
+            # — without this guard the caller would log
+            # ``model_call_finished`` with whatever bytes happened to
+            # accumulate before the break, misleading anyone reading
+            # sparrow.log into thinking the model produced output that
+            # actually went nowhere.
+            if self._interrupt_requested:
+                return None
+
             effective_finish_reason = finish_reason or "stop"
             if has_truncated_tool_args:
                 effective_finish_reason = "length"
@@ -7620,6 +7787,12 @@ class AIAgent:
                                     _fire_first_delta()
                                     self._fire_reasoning_delta(thinking_text)
 
+                # Return None when interrupted so the caller can drop
+                # the call entirely rather than persisting whatever
+                # bytes accumulated before break.  Mirrors the
+                # chat_completions guard above — see comment there.
+                if self._interrupt_requested:
+                    return None
                 # Return the native Anthropic Message for downstream processing
                 return stream.get_final_message()
 
@@ -7979,6 +8152,17 @@ class AIAgent:
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
+
+        # Inner thread completed but may have returned None because the
+        # for-loop broke on interrupt.  This race happens when the outer
+        # poll's t.is_alive() observation lands AFTER the inner thread
+        # already exited via the interrupt-break path — the interrupt
+        # check above never gets a chance to fire.  Re-raise here so
+        # the caller treats this exactly like a polled-interrupt
+        # abort: no model_call_finished with phantom content, no
+        # mock_response with partial bytes.
+        if self._interrupt_requested or result["response"] is None:
+            raise InterruptedError("Agent interrupted; streaming call abandoned")
         if result["error"] is not None:
             if deltas_were_sent["yes"]:
                 # Streaming failed AFTER some tokens were already delivered to
@@ -10201,6 +10385,11 @@ class AIAgent:
                     pass
             start = time.time()
             try:
+                try:
+                    from gateway.sparrow_log import log_event as _sparrow_event_tc
+                    _sparrow_event_tc("tool_call_starting", name=function_name, mode="concurrent")
+                except Exception:
+                    _sparrow_event_tc = None
                 result = self._invoke_tool(
                     function_name,
                     function_args,
@@ -10213,6 +10402,16 @@ class AIAgent:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
+            if _sparrow_event_tc is not None:
+                try:
+                    _sparrow_event_tc(
+                        "tool_call_finished",
+                        name=function_name,
+                        mode="concurrent",
+                        result_chars=len(str(result or "")),
+                    )
+                except Exception:
+                    pass
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
@@ -10550,6 +10749,11 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            try:
+                from gateway.sparrow_log import log_event as _sparrow_event_tc
+                _sparrow_event_tc("tool_call_starting", name=function_name)
+            except Exception:
+                _sparrow_event_tc = None
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -10818,6 +11022,15 @@ class AIAgent:
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
+            if _sparrow_event_tc is not None:
+                try:
+                    _sparrow_event_tc(
+                        "tool_call_finished",
+                        name=function_name,
+                        result_chars=len(str(function_result or "")),
+                    )
+                except Exception:
+                    pass
 
             # ── Per-tool /steer drain ───────────────────────────────────
             # Drain pending steer BETWEEN individual tool calls so the
@@ -11261,6 +11474,61 @@ class AIAgent:
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+        # External-memory prefetch handshake — done as early as possible
+        # (immediately after the user message lands, BEFORE any agent
+        # preprocessing) so:
+        #
+        #   1. ``receive`` is instant: it reads the cache that the
+        #      PRIOR turn's ``send`` warmed.  No latency added to this
+        #      turn even if the embedding+search is slow.
+        #   2. ``send`` for THIS turn fires as soon as we know the
+        #      query, maximizing wall-clock time for the embedding +
+        #      vector search to complete before the user types again.
+        #      The result lands in the cache and feeds the NEXT turn's
+        #      ``receive``.
+        #
+        # The order is RECEIVE → SEND on each turn.  Cross-turn pairing:
+        # ``send.query`` on turn N == ``receive.query`` on turn N+1.
+        # Same-turn pairing: not expected to match (and that's the
+        # point — that's how the cross-turn architecture is honest in
+        # the log).
+        _ext_prefetch_cache = ""
+        if self._memory_manager:
+            try:
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                # 1. receive — read whatever the prior turn's send
+                # warmed.  prefetch_all() is fast in steady state
+                # (cache hit, no network).
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                try:
+                    _matched_query = self._memory_manager.last_prefetch_query()
+                except Exception:
+                    _matched_query = ""
+                try:
+                    from gateway.sparrow_log import log_event as _sparrow_event
+                    _sparrow_event(
+                        "memory_prefetch_receive",
+                        query=_matched_query[:120],
+                        content=_ext_prefetch_cache,
+                    )
+                except Exception:
+                    pass
+                # 2. send — fire-and-forget for the NEXT turn.
+                if _query:
+                    try:
+                        self._memory_manager.queue_prefetch_all(_query)
+                        try:
+                            _sparrow_event(
+                                "memory_prefetch_send",
+                                query=_query[:120],
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
         # how many tool iterations THIS turn used.
@@ -11476,18 +11744,14 @@ class AIAgent:
             except Exception:
                 pass
 
-        # External memory provider: prefetch once before the tool loop.
-        # Reuse the cached result on every iteration to avoid re-calling
-        # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
-        _ext_prefetch_cache = ""
-        if self._memory_manager:
-            try:
-                _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
-            except Exception:
-                pass
+        # External memory prefetch was already read + queued at the
+        # very start of run_conversation (right after
+        # ``original_user_message`` was set) so the embedding/search
+        # has had every available ms to make progress before the model
+        # call below.  ``_ext_prefetch_cache`` is already populated.
+        # Reuse it on every iteration of the tool loop below — no
+        # re-call required (10 tool calls would otherwise be 10x
+        # latency + cost).
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -11499,6 +11763,11 @@ class AIAgent:
                 _turn_exit_reason = "interrupted_by_user"
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+                try:
+                    from gateway.sparrow_log import log_event as _sparrow_event
+                    _sparrow_event("interrupted", reason="user_sent_new_message", iteration=api_call_count)
+                except Exception:
+                    pass
                 break
             
             api_call_count += 1
@@ -11944,14 +12213,101 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
-                    if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
+                    try:
+                        from gateway.sparrow_log import log_event as _sparrow_event_mc
+                        _sparrow_event_mc(
+                            "model_call_starting",
+                            model=getattr(self, "model", "?"),
+                            iteration=api_call_count,
+                            streaming=_use_streaming,
                         )
-                    else:
-                        response = self._interruptible_api_call(api_kwargs)
-                    
+                    except Exception:
+                        _sparrow_event_mc = None
+                    try:
+                        if _use_streaming:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = self._interruptible_api_call(api_kwargs)
+                    except InterruptedError:
+                        # The streaming/non-streaming call was abandoned
+                        # mid-flight because the agent was interrupted
+                        # (user sent a new message, /stop, etc.).  Log
+                        # the finished event honestly so sparrow.log
+                        # doesn't look like the model produced output —
+                        # ``status=interrupted`` and empty text/tokens
+                        # tell the operator at a glance "we dropped
+                        # this call, ignore whatever the SDK still
+                        # has buffered".  Re-raise so the agent's
+                        # outer loop unwinds normally.
+                        if _sparrow_event_mc is not None:
+                            try:
+                                _sparrow_event_mc(
+                                    "model_call_finished",
+                                    model=getattr(self, "model", "?"),
+                                    status="interrupted",
+                                    input_tok=0,
+                                    cached_tok=0,
+                                    output_tok=0,
+                                    text="",
+                                )
+                            except Exception:
+                                pass
+                        raise
+
                     api_duration = time.time() - api_start_time
+                    if _sparrow_event_mc is not None:
+                        try:
+                            _usage = getattr(response, "usage", None)
+                            _in_tok = "?"
+                            _out_tok = "?"
+                            _cached_tok = 0
+                            if _usage is not None:
+                                # Provider field names differ:
+                                #   OpenAI: usage.prompt_tokens / usage.completion_tokens
+                                #   Anthropic: usage.input_tokens / usage.{cache_read,cache_write}_tokens / usage.output_tokens
+                                # normalize_usage() unifies them via CanonicalUsage.
+                                # Use the `prompt_tokens` PROPERTY (= input + cache_read +
+                                # cache_write) for the input column so prompt-cached calls
+                                # don't look like a 6-token request to operators.
+                                _canon = normalize_usage(
+                                    _usage,
+                                    provider=getattr(self, "provider", ""),
+                                    api_mode=getattr(self, "api_mode", ""),
+                                )
+                                _in_tok = getattr(_canon, "prompt_tokens", "?") or 0
+                                _out_tok = getattr(_canon, "output_tokens", "?") or 0
+                                _cached_tok = getattr(_canon, "cache_read_tokens", 0) or 0
+                            # Extract a compact preview of EVERYTHING the
+                            # model emitted this iteration so an operator
+                            # scanning sparrow.log sees not just token
+                            # counts but WHAT the model decided to do —
+                            # text reply, tool calls (with names + args),
+                            # or reasoning when there's nothing else.
+                            #
+                            # For a tool-call iteration the prose is
+                            # usually empty but the tool call itself is
+                            # the signal — we render it as
+                            # ``→ tool_name(arg=val, ...)`` so the line
+                            # tells the full story without scrolling to
+                            # the matching ``tool_call_starting`` event.
+                            #
+                            # Truncated at 512 chars — readable on one
+                            # log line, plenty for grepping.
+                            _text_preview = _summarize_model_response_for_event(response)
+                            if _text_preview and len(_text_preview) > 512:
+                                _text_preview = _text_preview[:512] + "…"
+                            _sparrow_event_mc(
+                                "model_call_finished",
+                                model=getattr(self, "model", "?"),
+                                input_tok=_in_tok,
+                                cached_tok=_cached_tok,
+                                output_tok=_out_tok,
+                                text=_text_preview,
+                            )
+                        except Exception:
+                            pass
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.

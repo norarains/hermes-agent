@@ -34,13 +34,26 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
+# Signature for the gateway-installed callback that delivers
+# memory-provider runtime failures as out-of-band user messages.  See
+# MemoryProvider._notify_user() and MemoryManager.set_notify_user_callback().
+NotifyUserCallback = Callable[[str, str, str], None]
+# Args: provider name, endpoint, error description.
+
+
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
+
+    # Set by MemoryManager.set_notify_user_callback() — the gateway uses
+    # this to surface runtime failures (sync_turn, MCP tool, commit) as
+    # out-of-band system messages instead of swallowing them as DEBUG
+    # logs.  Stays None when no gateway is attached (CLI runs, tests).
+    notify_user_callback: Optional[NotifyUserCallback] = None
 
     @property
     @abstractmethod
@@ -258,6 +271,33 @@ class MemoryProvider(ABC):
         - use only env vars (in which case get_config_schema() fields
           should all have ``env_var`` set and this method stays no-op).
         """
+
+    # -- Runtime-failure notification helper ---------------------------------
+
+    def _notify_user(self, *, endpoint: str, error: str) -> None:
+        """Surface a runtime failure (sync_turn, MCP tool, commit, ...) as
+        an out-of-band user message via the gateway.
+
+        Providers call this where they currently emit a DEBUG log on the
+        failure path, e.g.::
+
+            except Exception as e:
+                self._notify_user(endpoint=self._endpoint, error=str(e))
+
+        The gateway-installed callback resolves the active session's
+        platform/chat_id and pushes via ``adapter.send`` — the message
+        does NOT enter chat history (no session-store write).  If no
+        callback is set (CLI / tests / non-gateway agents) this is a
+        silent no-op so providers can call it unconditionally.
+        """
+        cb = self.notify_user_callback
+        if cb is None:
+            return
+        try:
+            cb(self.name, endpoint, error)
+        except Exception as exc:
+            # Never let notification plumbing crash the provider.
+            logger.debug("notify_user_callback failed: %s", exc)
 
     def on_memory_write(
         self,

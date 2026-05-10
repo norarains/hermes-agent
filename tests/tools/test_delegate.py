@@ -142,6 +142,45 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_soul_md_prepended_when_present(self):
+        """SOUL.md is injected raw at the front of the child prompt,
+        mirroring the parent's _build_full_system_prompt slot #1.
+
+        Locks the contract: delegated subagents inherit the operator's
+        identity / style / Avoid rules — without it, e.g. the `禁止
+        curl|python3` rule lives only in the parent's prompt and the
+        child re-makes the same mistake.
+
+        Also locks: when SOUL is present, we do NOT emit a competing
+        "you are a focused subagent" identity claim.  SOUL owns *who*,
+        the `## Delegated Task` header scopes *what*."""
+        fake_soul = "# Identity\n\nYou are TestPersona.\n\n# Avoid\n\n- forbidden_marker_xyz"
+        with patch("tools.delegate_tool.load_soul_md", return_value=fake_soul):
+            prompt = _build_child_system_prompt("Do thing")
+        self.assertIn("forbidden_marker_xyz", prompt)
+        self.assertIn("TestPersona", prompt)
+        self.assertIn("## Delegated Task", prompt)
+        # SOUL must come BEFORE the task-scope header so its identity
+        # claim is the one the model anchors on.
+        self.assertLess(
+            prompt.index("forbidden_marker_xyz"),
+            prompt.index("## Delegated Task"),
+        )
+        # No competing identity sentence when SOUL is present.
+        self.assertNotIn("focused subagent", prompt)
+
+    def test_no_soul_md_falls_back_cleanly(self):
+        """When SOUL.md is unavailable (test env, fresh install), the
+        child prompt falls back to a generic identity sentence so the
+        model still has something to anchor on instead of jumping
+        straight into the task header."""
+        with patch("tools.delegate_tool.load_soul_md", return_value=None):
+            prompt = _build_child_system_prompt("Do thing")
+        self.assertIn("Do thing", prompt)
+        self.assertIn("## Delegated Task", prompt)
+        # Generic identity fallback is present only when SOUL absent.
+        self.assertIn("focused subagent", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

@@ -477,7 +477,12 @@ class QQAdapter(BasePlatformAdapter):
                     return
 
                 code = exc.code
-                logger.warning(
+                # Routine session-invalidate codes (will reconnect cleanly)
+                # log at INFO; everything else stays WARNING because it
+                # indicates either a transient anomaly or a fatal close.
+                _routine_close_codes = (4006, 4007, 4008, 4009)
+                _close_log = logger.info if code in _routine_close_codes else logger.warning
+                _close_log(
                     "[%s] WebSocket closed: code=%s reason=%s",
                     self._log_tag,
                     code,
@@ -589,7 +594,14 @@ class QQAdapter(BasePlatformAdapter):
             except Exception as exc:
                 if not self._running:
                     return
-                logger.warning("[%s] WebSocket error: %s", self._log_tag, exc)
+                # All errors here are transient: the loop reconnects on
+                # the next iteration with exponential backoff.  Truly
+                # fatal close codes (4914/4915 banned/offline) are
+                # caught above as QQCloseError and already logger.error.
+                # Reaching MAX_RECONNECT_ATTEMPTS below also escalates
+                # to logger.error.  Keep this line at INFO so a flapping
+                # QQ gateway doesn't fill the operator's WARNING stream.
+                logger.info("[%s] WebSocket error: %s", self._log_tag, exc)
                 self._mark_disconnected()
                 self._fail_pending("Connection interrupted")
 
@@ -623,7 +635,12 @@ class QQAdapter(BasePlatformAdapter):
             logger.info("[%s] Reconnected", self._log_tag)
             return True
         except Exception as exc:
-            logger.warning("[%s] Reconnect failed: %s", self._log_tag, exc)
+            # Each individual reconnect attempt failure is routine — the
+            # caller increments backoff and retries up to
+            # MAX_RECONNECT_ATTEMPTS.  Hitting that ceiling is logged at
+            # ERROR by the caller; we don't need WARNING for every
+            # interim retry that flapping QQ gateways trigger.
+            logger.info("[%s] Reconnect failed: %s", self._log_tag, exc)
             return False
 
     async def _read_events(self) -> None:

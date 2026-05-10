@@ -1112,6 +1112,8 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
+                if not self.should_suspend_on_startup(entry):
+                    continue
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
@@ -1120,6 +1122,17 @@ class SessionStore:
             if count:
                 self._save()
         return count
+
+    def should_suspend_on_startup(self, entry: SessionEntry) -> bool:
+        """Return whether startup crash/stuck-loop recovery may suspend this session."""
+        policy = self.config.get_reset_policy(
+            platform=entry.platform,
+            session_type=entry.chat_type,
+        )
+        # DESIGN INVARIANT: be careful not to break this. `mode: none` means
+        # Hermes must not clear chat history automatically, including startup
+        # safety suspension after an unclean gateway exit.
+        return policy.mode != "none"
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -1280,6 +1293,140 @@ class SessionStore:
             with open(transcript_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(message, ensure_ascii=False) + "\n")
     
+    def update_last_assistant_content(
+        self,
+        session_id: str,
+        expected_content: str,
+        new_content: str,
+    ) -> bool:
+        """Atomically rewrite the most recent assistant entry's
+        ``content`` IFF every storage layer currently holds
+        ``expected_content``.
+
+        The "every layer" check is the safety net: NapCat's post-send
+        decoration runs AFTER the agent has already flushed the raw
+        entry to SQLite + JSONL.  If anything else has touched the
+        last-assistant entry between flush and decoration (concurrent
+        turn, retry, /retry, double-call), one of the layers will
+        diverge from ``expected_content`` and we bail rather than
+        corrupt history.  Returns True only when both layers were
+        verified AND updated.
+        """
+        if not isinstance(expected_content, str):
+            logger.warning(
+                "update_last_assistant_content(session=%s): "
+                "expected_content is %s, not str — refusing update",
+                session_id, type(expected_content).__name__,
+            )
+            return False
+
+        # 1. Verify SQLite
+        sqlite_match = True
+        if self._db is not None:
+            try:
+                sqlite_content = self._db.get_last_assistant_content(session_id)
+            except Exception as exc:
+                logger.warning(
+                    "update_last_assistant_content(session=%s): "
+                    "SQLite read failed (%s) — refusing update",
+                    session_id, exc,
+                )
+                return False
+            if sqlite_content != expected_content:
+                logger.warning(
+                    "update_last_assistant_content(session=%s): "
+                    "SQLite last-assistant DIVERGED from expected — "
+                    "refusing update.  expected=%r ; sqlite=%r",
+                    session_id,
+                    expected_content[:120],
+                    (sqlite_content or "")[:120]
+                    if sqlite_content is not None else None,
+                )
+                sqlite_match = False
+
+        # 2. Verify JSONL
+        transcript_path = self.get_transcript_path(session_id)
+        jsonl_lines: List[str] = []
+        jsonl_last_assistant_idx: Optional[int] = None
+        jsonl_last_assistant_entry: Optional[Dict[str, Any]] = None
+        if transcript_path.exists():
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                jsonl_lines = f.readlines()
+            for i in range(len(jsonl_lines) - 1, -1, -1):
+                line = jsonl_lines[i].strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("role") == "assistant":
+                    jsonl_last_assistant_idx = i
+                    jsonl_last_assistant_entry = entry
+                    break
+
+        jsonl_match = True
+        if jsonl_last_assistant_entry is not None:
+            jsonl_content = jsonl_last_assistant_entry.get("content")
+            if jsonl_content != expected_content:
+                logger.warning(
+                    "update_last_assistant_content(session=%s): "
+                    "JSONL last-assistant DIVERGED from expected — "
+                    "refusing update.  expected=%r ; jsonl=%r",
+                    session_id,
+                    expected_content[:120],
+                    (jsonl_content or "")[:120]
+                    if isinstance(jsonl_content, str) else jsonl_content,
+                )
+                jsonl_match = False
+
+        if not (sqlite_match and jsonl_match):
+            return False
+
+        # 3. Apply both updates.  If SQLite update fails, leave JSONL
+        # alone — divergence is worse than no decoration.
+        if self._db is not None:
+            try:
+                ok = self._db.update_last_assistant_content(
+                    session_id, new_content,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "update_last_assistant_content(session=%s): "
+                    "SQLite UPDATE raised: %s",
+                    session_id, exc,
+                )
+                return False
+            if not ok:
+                logger.warning(
+                    "update_last_assistant_content(session=%s): "
+                    "SQLite UPDATE matched 0 rows — last assistant entry "
+                    "vanished between read and write",
+                    session_id,
+                )
+                return False
+
+        if jsonl_last_assistant_idx is not None and jsonl_last_assistant_entry is not None:
+            try:
+                jsonl_last_assistant_entry["content"] = new_content
+                jsonl_lines[jsonl_last_assistant_idx] = (
+                    json.dumps(jsonl_last_assistant_entry, ensure_ascii=False)
+                    + "\n"
+                )
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.writelines(jsonl_lines)
+            except OSError as exc:
+                logger.warning(
+                    "update_last_assistant_content: JSONL rewrite failed "
+                    "(SQLite was already updated): %s",
+                    exc,
+                )
+                # SQLite already updated — return True since the LLM
+                # will see the decorated entry from SQLite (the longer
+                # / matching source wins in load_transcript).
+
+        return True
+
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.
         

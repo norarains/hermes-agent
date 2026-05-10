@@ -109,6 +109,8 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    ONEBOT_NAPCAT = "onebot_napcat"
+
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -396,6 +398,12 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
     ),
+    # NapCat (OneBot v11) — sparrow customization, gated on NAPCAT_ENABLED
+    # env var.  Preserved here in the upstream-style registry instead of
+    # an inline elif so future rebases don't reopen this conflict.
+    Platform.ONEBOT_NAPCAT: lambda cfg: os.getenv(
+        "NAPCAT_ENABLED", ""
+    ).lower() in ("1", "true", "yes"),
 }
 
 
@@ -1706,6 +1714,30 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # NapCat (OneBot v11 — real QQ account, third-party framework)
+    if os.getenv("NAPCAT_ENABLED", "").lower() in ("1", "true", "yes"):
+        if Platform.ONEBOT_NAPCAT not in config.platforms:
+            config.platforms[Platform.ONEBOT_NAPCAT] = PlatformConfig()
+        config.platforms[Platform.ONEBOT_NAPCAT].enabled = True
+        # Hermes's home-channel lookup is hardcoded to
+        # ``<platform_value>_HOME_CHANNEL`` (gateway/run.py line ~4461), so
+        # the canonical env var is ONEBOT_NAPCAT_HOME_CHANNEL.  We also
+        # accept NAPCAT_HOME_CHANNEL for back-compat with earlier wizard
+        # versions that used the shorter name.
+        napcat_home = (
+            os.getenv("ONEBOT_NAPCAT_HOME_CHANNEL", "").strip()
+            or os.getenv("NAPCAT_HOME_CHANNEL", "").strip()
+        )
+        if napcat_home:
+            config.platforms[Platform.ONEBOT_NAPCAT].home_channel = HomeChannel(
+                platform=Platform.ONEBOT_NAPCAT,
+                chat_id=napcat_home,
+                name=(
+                    os.getenv("ONEBOT_NAPCAT_HOME_CHANNEL_NAME")
+                    or os.getenv("NAPCAT_HOME_CHANNEL_NAME", "Home")
+                ),
+            )
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

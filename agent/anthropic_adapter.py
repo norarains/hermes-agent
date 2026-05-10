@@ -18,7 +18,7 @@ import platform
 import subprocess
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_env_path, get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
@@ -939,6 +939,126 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
             "Preferring Claude Code credential file over static env OAuth token so refresh can proceed"
         )
         return resolved
+    return None
+
+
+def _usage_token_is_expiring() -> bool:
+    """Return True when the usage-only OAuth access token should be refreshed."""
+    import time
+
+    raw_expires_at = os.getenv("ANTHROPIC_USAGE_EXPIRES_AT_MS", "").strip()
+    if not raw_expires_at:
+        return False
+    try:
+        expires_at_ms = int(raw_expires_at)
+    except ValueError:
+        logger.debug("Ignoring invalid ANTHROPIC_USAGE_EXPIRES_AT_MS value")
+        return False
+    now_ms = int(time.time() * 1000)
+    return now_ms >= expires_at_ms - 60_000
+
+
+def _write_dotenv_values(values: Dict[str, str]) -> None:
+    """Persist refreshed usage credentials into HERMES_HOME/.env.
+
+    DESIGN INVARIANT: be careful not to break this.  Usage credentials are
+    independent from runtime inference credentials; never rewrite
+    ``ANTHROPIC_TOKEN`` here.
+    """
+    env_path = get_env_path()
+    existing_mode = None
+    if env_path.exists():
+        try:
+            existing_mode = env_path.stat().st_mode & 0o777
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            logger.debug("Failed to read %s for usage token persistence: %s", env_path, exc)
+            return
+    else:
+        lines = []
+
+    seen: set[str] = set()
+    next_lines: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            next_lines.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in values:
+            next_lines.append(f"{key}={values[key]}")
+            seen.add(key)
+        else:
+            next_lines.append(line)
+
+    for key, value in values.items():
+        if key not in seen:
+            next_lines.append(f"{key}={value}")
+
+    try:
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = env_path.with_name(env_path.name + ".tmp")
+        tmp_path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+        tmp_path.replace(env_path)
+        env_path.chmod(existing_mode if existing_mode is not None else 0o600)
+    except OSError as exc:
+        logger.debug("Failed to persist refreshed usage token to %s: %s", env_path, exc)
+
+
+def _persist_anthropic_usage_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+) -> None:
+    values = {
+        "ANTHROPIC_USAGE_TOKEN": access_token,
+        "ANTHROPIC_USAGE_REFRESH_TOKEN": refresh_token,
+        "ANTHROPIC_USAGE_EXPIRES_AT_MS": str(expires_at_ms),
+    }
+    os.environ.update(values)
+    _write_dotenv_values(values)
+
+
+def refresh_anthropic_usage_token() -> Optional[str]:
+    """Refresh the usage-report OAuth token without touching inference auth."""
+    refresh_token = os.getenv("ANTHROPIC_USAGE_REFRESH_TOKEN", "").strip()
+    if not refresh_token:
+        logger.debug("No ANTHROPIC_USAGE_REFRESH_TOKEN available — cannot refresh usage token")
+        return None
+
+    try:
+        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+    except Exception as exc:
+        logger.debug("Failed to refresh Anthropic usage token: %s", exc)
+        return None
+
+    access_token = str(refreshed.get("access_token", "") or "").strip()
+    next_refresh = str(refreshed.get("refresh_token", refresh_token) or "").strip()
+    expires_at_ms = refreshed.get("expires_at_ms")
+    if not access_token or not next_refresh or not expires_at_ms:
+        logger.debug("Anthropic usage refresh response was incomplete")
+        return None
+
+    _persist_anthropic_usage_credentials(access_token, next_refresh, int(expires_at_ms))
+    logger.debug("Successfully refreshed Anthropic usage token")
+    return access_token
+
+
+def resolve_anthropic_usage_token() -> Optional[str]:
+    """Resolve the Anthropic OAuth token used only for account-limit queries.
+
+    Runtime Anthropic calls keep using ``resolve_anthropic_token()``.  This
+    separate env var lets gateway ``/usage`` query Claude account quotas with a
+    Claude Code login token that has ``user:profile`` without changing the
+    token used for model inference.
+    """
+    usage_token = os.getenv("ANTHROPIC_USAGE_TOKEN", "").strip()
+    if usage_token:
+        if _usage_token_is_expiring():
+            refreshed = refresh_anthropic_usage_token()
+            if refreshed:
+                return refreshed
+        return usage_token
     return None
 
 
@@ -2060,5 +2180,4 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
 

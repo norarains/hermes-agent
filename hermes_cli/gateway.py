@@ -3599,6 +3599,22 @@ _PLATFORMS = [
              "help": "The App Secret (used for HMAC signing) from your Yuanbao IM Bot."},
         ],
     },
+    {
+        "key": "onebot_napcat",
+        "label": "QQ (NapCat — real account)",
+        "emoji": "🐱",
+        "token_var": "NAPCAT_ENABLED",
+        "setup_instructions": [
+            "Drives a real QQ account via NapCat (NTQQ-based, OneBot v11).",
+            "Unlike the official QQ Bot API, this can join groups and DM anyone.",
+            "⚠  Third-party QQ frameworks risk account bans — use a secondary",
+            "   QQ account, and prefer residential IP addresses.",
+            "",
+            "The wizard will start NapCat, you'll scan a QR code at",
+            "http://localhost:6099/webui to log in, and your config is saved.",
+        ],
+        "vars": [],  # custom wizard handles everything
+    },
 ]
 def _all_platforms() -> list[dict]:
     """Return the full list of platforms for setup menus.
@@ -3678,6 +3694,11 @@ def _platform_status(platform: dict) -> str:
             if session_file.exists():
                 return "configured + paired"
             return "enabled, not paired"
+        return "not configured"
+    if platform.get("key") == "onebot_napcat":
+        if val and val.lower() in ("true", "1", "yes"):
+            self_id = get_env_value("NAPCAT_SELF_ID")
+            return f"configured (QQ {self_id})" if self_id else "enabled, not logged in"
         return "not configured"
     if platform.get("key") == "signal":
         account = get_env_value("SIGNAL_ACCOUNT")
@@ -4416,6 +4437,17 @@ def _setup_feishu():
         print_info(f"  Bot: {bot_name}")
 
 
+def _setup_onebot_napcat():
+    """Delegate to the onebot_napcat wizard module."""
+    try:
+        from gateway.platforms.onebot_napcat.setup_wizard import cmd_setup_onebot_napcat
+    except Exception as exc:
+        print_error(f"  onebot_napcat wizard import failed: {exc}")
+        print_info("  Update the image with ./control/build.sh and try again.")
+        return
+    cmd_setup_onebot_napcat()
+
+
 def _setup_qqbot():
     """Interactive setup for QQ Bot — scan-to-configure or manual credentials."""
     print()
@@ -4659,6 +4691,11 @@ def _builtin_setup_fn(key: str):
         "feishu": _setup_feishu,
         "wecom": _setup_wecom,
         "qqbot": _setup_qqbot,
+        # Sparrow customization: NapCat (OneBot v11) backend for QQ.
+        # Lives under gateway/platforms/onebot_napcat/ and reuses the
+        # built-in dispatch path so future upstream refactors of this
+        # table don't drop our wizard on the floor.
+        "onebot_napcat": _setup_onebot_napcat,
     }.get(key)
 def _configure_platform(platform: dict) -> None:
     """Run the interactive setup flow for a single platform.

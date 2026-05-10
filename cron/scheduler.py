@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -28,7 +29,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -91,7 +92,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "onebot_napcat",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -111,6 +112,7 @@ _HOME_TARGET_ENV_VARS = {
     "weixin": "WEIXIN_HOME_CHANNEL",
     "bluebubbles": "BLUEBUBBLES_HOME_CHANNEL",
     "qqbot": "QQBOT_HOME_CHANNEL",
+    "onebot_napcat": "ONEBOT_NAPCAT_HOME_CHANNEL",
 }
 
 # Legacy env var names kept for back-compat.  Each entry is the current
@@ -536,6 +538,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     delivery_errors = []
 
+    # Compute the text to mirror into the live session transcript for
+    # each successful delivery.  We strip MEDIA: tags (the actual files
+    # are ephemeral and won't exist when the live session reads back)
+    # but skip the wrap header — operators / the bot itself want to see
+    # the agent's actual response, not the cron delivery preamble.
+    #
+    # No cron-specific prefix is added here: ``mirror_to_session`` writes
+    # ``mirror=True, mirror_source=...`` metadata into the JSONL record,
+    # and the gateway's transcript loader (gateway/run.py) prepends
+    # ``[Delivered from <mirror_source>] ...`` at live-session load time
+    # for every mirror record.  Adding our own ``[cron @ ...]`` prefix
+    # here would double-tag the content (the LLM would see both).  Using
+    # the job *name* in the source label means the gateway prefix is
+    # human-readable: ``[Delivered from cron:每日早报] ...``.
+    _mirror_media, _mirror_text = BasePlatformAdapter.extract_media(content or "")
+    _mirror_annotated = (_mirror_text or "").strip()
+    _job_name_for_label = (job.get("name") or "").strip() or job.get("id", "") or "?"
+    _mirror_source_label = f"cron:{_job_name_for_label}"
+
+    def _mirror_to_live_session(platform_label: str, chat_id_str: str, thread_id_str: Optional[str]) -> None:
+        """Append a synthetic assistant entry to the target chat's live
+        session transcript so the bot's next live turn knows what it
+        sent via cron (closes the cron-amnesia bug)."""
+        if not _mirror_annotated:
+            return
+        try:
+            from gateway.mirror import mirror_to_session
+            mirror_to_session(
+                platform_label,
+                chat_id_str,
+                _mirror_annotated,
+                source_label=_mirror_source_label,
+                thread_id=thread_id_str,
+            )
+        except Exception as exc:
+            logger.debug("Job '%s': cron-to-session mirror failed: %s", job.get("id", "?"), exc)
+
     for target in targets:
         platform_name = target["platform"]
         chat_id = target["chat_id"]
@@ -616,6 +655,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    _mirror_to_live_session(platform_name, chat_id, thread_id)
             except Exception as e:
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
@@ -649,6 +689,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _mirror_to_live_session(platform_name, chat_id, thread_id)
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -924,6 +965,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "to the user — do NOT use send_message or try to deliver "
         "the output yourself. Just produce your report/output as your "
         "final response and the system handles the rest. "
+        "OUTPUT: Return only the final content to deliver; do not include "
+        "planning, reasoning, or an \"I'll do X\" preface. "
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
@@ -1449,11 +1492,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Sparrow customization: load MEMORY.md / USER.md into the prompt
+            # so cron jobs have access to user preferences (yile contact,
+            # tool usage rules, etc.).  ``skip_memory`` is upstream's coarse
+            # flag that gates BOTH the built-in markdown memory store AND
+            # the external memory provider (openviking) — we want only the
+            # former.  See the explicit ``_memory_manager = None`` below.
+            skip_memory=False,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+
+        # Disable the external memory provider (openviking) for cron runs.
+        # Cron prompts are task instructions, not user conversation — letting
+        # the post-session memory extractor synthesize "memories" from them
+        # produces inverted / trivial / pollutive entries (see prior
+        # incidents: `工具可用性确认.md`, inverted `群聊回复规则.md`).
+        # Built-in MEMORY.md / USER.md remain available via ``_memory_store``
+        # because that subsystem is read-only at session start.
+        agent._memory_manager = None
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -1654,6 +1712,113 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _process_job_with_events(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = True,
+) -> bool:
+    """Run one due cron job end-to-end: execute, save, deliver, mark.
+
+    Wraps the run with ``cron_run_starting`` / ``cron_run_finished``
+    sparrow events so the operator can see in sparrow.log when cron
+    fires and what the outcome was — without those events, cron-driven
+    activity is invisible at the high-level timeline (gateway only logs
+    user-driven turns).
+    """
+    # Lazy import — log_event is a no-op until init_sparrow_log() runs.
+    try:
+        from gateway.sparrow_log import log_event as _sparrow_event
+    except Exception:
+        def _sparrow_event(*_a, **_kw):  # type: ignore[no-redef]
+            pass
+
+    _job_id = job.get("id", "?")
+    _job_name = job.get("name", _job_id)
+    _started_ts = time.time()
+    _sparrow_event(
+        "cron_run_starting",
+        job_id=_job_id, name=_job_name,
+        schedule=job.get("schedule_display") or job.get("schedule") or "",
+        deliver=job.get("deliver", "local"),
+        workdir=(job.get("workdir") or "").strip() or None,
+    )
+
+    def _emit_finished(status: str, **extra: Any) -> None:
+        _sparrow_event(
+            "cron_run_finished",
+            job_id=_job_id, status=status,
+            duration_ms=int((time.time() - _started_ts) * 1000),
+            **extra,
+        )
+
+    try:
+        success, output, final_response, error = run_job(job)
+
+        output_file = save_job_output(job["id"], output)
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        # Deliver the final response to the origin/target chat.
+        # If the agent responded with [SILENT], skip delivery (but
+        # output is already saved above).  Failed jobs always deliver.
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+        should_deliver = bool(deliver_content)
+        _was_silent = False
+        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+            _was_silent = True
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+        # Treat empty final_response as a soft failure so last_status
+        # is not "ok" — the agent ran but produced nothing useful.
+        # (issue #8585)
+        if success and not final_response:
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+        # Status flavors so operators can grep:
+        #   ok              — agent ran, response generated, delivery (if any) succeeded
+        #   silent          — agent returned [SILENT]; no delivery (gate-script case
+        #                     also lands here because run_job returns SILENT_MARKER)
+        #   delivery_failed — agent OK but the platform send failed
+        #   failed          — run_job itself reported failure (agent error/empty)
+        if not success:
+            _emit_finished(
+                "failed",
+                response_chars=len(final_response or ""),
+                error=error,
+            )
+        elif _was_silent:
+            _emit_finished("silent", response_chars=0)
+        elif delivery_error:
+            _emit_finished(
+                "delivery_failed",
+                response_chars=len(final_response or ""),
+                error=delivery_error,
+            )
+        else:
+            _emit_finished("ok", response_chars=len(final_response or ""))
+        return True
+
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job["id"], e)
+        mark_job_run(job["id"], False, str(e))
+        _emit_finished("error", error=repr(e))
+        return False
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -1729,45 +1894,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             )
 
         def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end: execute, save, deliver, mark."""
-            try:
-                success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response:
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                return True
-
-            except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
-                return False
+            return _process_job_with_events(job, adapters=adapters, loop=loop, verbose=verbose)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —

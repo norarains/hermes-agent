@@ -915,6 +915,9 @@ display:
   # Ctrl+C (or /stop in gateway) always interrupts regardless of this setting.
   # Toggle at runtime with /busy <interrupt|queue|steer>.
   busy_input_mode: interrupt
+  # Send a one-line chat acknowledgment when a message arrives while Hermes is
+  # busy ("Queued for the next turn" / "Interrupting current task").
+  busy_ack: true
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use

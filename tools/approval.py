@@ -1094,6 +1094,15 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
+                # Surface the tirith flag so the gateway prompt can hide
+                # ``/approve always`` (mirrors the CLI's ``allow_permanent=
+                # not has_tirith`` policy at line 1115): tirith findings
+                # never get permanent allowlisting because broad
+                # always-trust on terminal-injection / pipe-to-interpreter
+                # patterns defeats the security intent.  Showing the
+                # option as available would just confuse the user when
+                # the persistence path silently downgrades it.
+                "has_tirith": has_tirith,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:

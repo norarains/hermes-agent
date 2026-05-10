@@ -726,6 +726,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
+        elif platform == Platform.ONEBOT_NAPCAT:
+            result = await _send_onebot_napcat(pconfig, chat_id, chunk)
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
@@ -1868,6 +1870,77 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
+
+
+async def _send_onebot_napcat(pconfig, chat_id, message):
+    """Send via NapCat (OneBot v11) over its local WS.
+
+    Only works when NapCat is already running — typically because the gateway
+    is active and has spawned it.  Cron-delivered messages therefore require
+    a live gateway.  ``chat_id`` uses the normalized ``group_<id>`` /
+    ``private_<id>`` prefix scheme.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return _error("OneBot/NapCat direct send requires aiohttp.")
+
+    ws_url = os.getenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
+    token = os.getenv("NAPCAT_ACCESS_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    if chat_id.startswith("group_"):
+        action, params_key = "send_group_msg", "group_id"
+        target_id = chat_id[len("group_"):]
+    elif chat_id.startswith("private_"):
+        action, params_key = "send_private_msg", "user_id"
+        target_id = chat_id[len("private_"):]
+    else:
+        return _error(f"OneBot/NapCat chat_id must start with 'group_' or 'private_': {chat_id!r}")
+
+    try:
+        target_int = int(target_id)
+    except ValueError:
+        return _error(f"OneBot/NapCat chat_id has non-numeric suffix: {chat_id!r}")
+
+    payload = {
+        "action": action,
+        "params": {
+            params_key: target_int,
+            "message": [{"type": "text", "data": {"text": message[:4000]}}],
+        },
+        "echo": "send_message_tool",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_url, headers=headers, heartbeat=10) as ws:
+                await ws.send_json(payload)
+                # Wait up to 15s for the matching echo response
+                import asyncio
+                deadline = asyncio.get_running_loop().time() + 15
+                while asyncio.get_running_loop().time() < deadline:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    import json as _json
+                    frame = _json.loads(msg.data)
+                    if str(frame.get("echo", "")) != "send_message_tool":
+                        continue
+                    if frame.get("status") == "ok":
+                        return {
+                            "success": True,
+                            "platform": "onebot_napcat",
+                            "chat_id": chat_id,
+                            "message_id": str((frame.get("data") or {}).get("message_id", "")),
+                        }
+                    return _error(f"NapCat send failed: {frame.get('message', 'unknown')}")
+                return _error("NapCat send timed out awaiting action echo")
+    except Exception as e:
+        return _error(
+            f"NapCat send failed: {e}. Is the gateway running so NapCat is up? "
+            f"(tried {ws_url})"
+        )
 
 
 # --- Registry ---

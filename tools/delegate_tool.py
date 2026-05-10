@@ -30,6 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
+from agent.prompt_builder import load_soul_md
 from toolsets import TOOLSETS
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
@@ -572,17 +573,46 @@ def _build_child_system_prompt(
 ) -> str:
     """Build a focused system prompt for a child agent.
 
+    Identity layer (SOUL.md from HERMES_HOME) is prepended raw — same
+    format as the parent's ``_build_full_system_prompt`` slot #1 in
+    ``run_agent.py``: no wrapper, SOUL's own ``# Identity / # Style /
+    # Avoid / # Defaults`` headers preserved.  Without this the child
+    has zero visibility into user-defined operational rules (e.g.
+    ``禁止 curl | python3``), persona, or style, and re-makes every
+    mistake the parent already learned to avoid.
+
     When role='orchestrator', appends a delegation-capability block
     modeled on OpenClaw's buildSubagentSystemPrompt (canSpawn branch at
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
+    parts: List[str] = []
+
+    # Identity layer: SOUL.md raw, mirroring run_agent._build_full_system_prompt
+    # slot #1.  Joined to the next block by a blank-line separator (the
+    # `""` entry below is what the final "\n".join turns into a blank line).
+    #
+    # When SOUL is present we deliberately do NOT claim a separate "you are
+    # a focused subagent" identity — that would conflict with SOUL's own
+    # # Identity section.  The `## Delegated Task` header below scopes
+    # *what* to do; SOUL still owns *who you are*.  When SOUL is absent
+    # (fresh install / test env) we fall back to a generic identity sentence
+    # so the model has something to anchor on.
+    soul = load_soul_md()
+    if soul:
+        parts.extend([soul, ""])
+    else:
+        parts.extend([
+            "You are a focused subagent working on a specific delegated task.",
+            "",
+        ])
+
+    parts.extend([
+        "## Delegated Task",
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():

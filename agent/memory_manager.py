@@ -30,7 +30,7 @@ import re
 import inspect
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, NotifyUserCallback
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -259,6 +259,21 @@ class MemoryManager:
                 return p
         return None
 
+    def set_notify_user_callback(self, callback: Optional[NotifyUserCallback]) -> None:
+        """Install (or clear) the gateway-side user-notification callback
+        on every registered provider.
+
+        The gateway calls this once per turn (after building the agent)
+        to wire memory-provider runtime failures to out-of-band system
+        messages.  Providers that never call ``self._notify_user(...)``
+        are unaffected; opt-in is per-provider.
+
+        Pass ``None`` to clear (used by tests / shutdown / non-gateway
+        agents that re-use a manager across contexts).
+        """
+        for p in self._providers:
+            p.notify_user_callback = callback
+
     # -- System prompt -------------------------------------------------------
 
     def build_system_prompt(self) -> str:
@@ -311,6 +326,32 @@ class MemoryManager:
                     "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
+
+    def last_prefetch_query(self) -> str:
+        """Return the query string that produced the most recently
+        cached prefetch result, across providers.  Used by sparrow
+        event logging so the ``memory_prefetch_receive`` event can
+        attribute its ``content`` field to the query that actually ran
+        against the backend (not whatever query the current turn
+        happens to be asking about — the cache was warmed at end of
+        the PRIOR turn).
+
+        Returns ``""`` when no provider has produced a prefetch yet,
+        or when no provider implements ``last_prefetch_query`` — in
+        which case the receive event safely falls back to omitting
+        the attribution rather than fabricating one.
+        """
+        for provider in self._providers:
+            getter = getattr(provider, "last_prefetch_query", None)
+            if not callable(getter):
+                continue
+            try:
+                q = getter() or ""
+            except Exception:
+                continue
+            if q:
+                return q
+        return ""
 
     # -- Sync ----------------------------------------------------------------
 

@@ -31,6 +31,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -157,17 +158,32 @@ class _VikingClient:
         return data
 
     def get(self, path: str, **kwargs) -> dict:
-        resp = self._httpx.get(
-            self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
-        )
-        return self._parse_response(resp)
+        # Sparrow instrumentation: wrap upstream's _parse_response with perf timing.
+        t0 = time.perf_counter()
+        try:
+            resp = self._httpx.get(
+                self._url(path), headers=self._headers(), timeout=_TIMEOUT, **kwargs
+            )
+            data = self._parse_response(resp)
+            logger.info("viking GET %s -> %d (%dms)", path, resp.status_code, int((time.perf_counter() - t0) * 1000))
+            return data
+        except Exception as e:
+            logger.info("viking GET %s -> error %s (%dms)", path, e, int((time.perf_counter() - t0) * 1000))
+            raise
 
     def post(self, path: str, payload: dict = None, **kwargs) -> dict:
-        resp = self._httpx.post(
-            self._url(path), json=payload or {}, headers=self._headers(),
-            timeout=_TIMEOUT, **kwargs
-        )
-        return self._parse_response(resp)
+        t0 = time.perf_counter()
+        try:
+            resp = self._httpx.post(
+                self._url(path), json=payload or {}, headers=self._headers(),
+                timeout=_TIMEOUT, **kwargs
+            )
+            data = self._parse_response(resp)
+            logger.info("viking POST %s -> %d (%dms)", path, resp.status_code, int((time.perf_counter() - t0) * 1000))
+            return data
+        except Exception as e:
+            logger.info("viking POST %s -> error %s (%dms)", path, e, int((time.perf_counter() - t0) * 1000))
+            raise
 
     def upload_temp_file(self, file_path: Path) -> str:
         mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
@@ -186,12 +202,16 @@ class _VikingClient:
         return temp_file_id
 
     def health(self) -> bool:
+        t0 = time.perf_counter()
         try:
             resp = self._httpx.get(
                 self._url("/health"), headers=self._headers(), timeout=3.0
             )
-            return resp.status_code == 200
-        except Exception:
+            ok = resp.status_code == 200
+            logger.info("viking GET /health -> %d (%dms)", resp.status_code, int((time.perf_counter() - t0) * 1000))
+            return ok
+        except Exception as e:
+            logger.info("viking GET /health -> error %s (%dms)", e, int((time.perf_counter() - t0) * 1000))
             return False
 
 
@@ -392,8 +412,23 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._api_key = ""
         self._session_id = ""
         self._turn_count = 0
+        # Commit batching: each /commit triggers OpenViking's memory
+        # extractor (an LLM round-trip with full transcript), which is
+        # the dominant per-turn cost. Batch N turns of message posts
+        # under one commit; flush forces a final commit on shutdown so
+        # no batched data is lost on Ctrl+C / SIGTERM.
+        self._uncommitted_count = 0
+        self._commit_every_n_turns = 10
+        self._commit_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
         self._prefetch_result = ""
+        # Track the QUERY that produced the cached _prefetch_result so
+        # ``last_prefetch_query()`` can surface what the search actually
+        # ran against.  Without this the agent has no way to log
+        # honestly: the prefetch_receive event would show the CURRENT
+        # turn's query alongside content computed for the PREVIOUS
+        # turn's query — i.e. fields that look paired but aren't.
+        self._prefetch_query = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
 
@@ -438,6 +473,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "default": "hermes",
                 "env_var": "OPENVIKING_AGENT",
             },
+            {
+                "key": "commit_every_n_turns",
+                "description": "How many turns to batch before triggering a commit (memory extraction). Higher = less LLM cost, lower = fresher memory. Force-flushed on gateway shutdown so no batched data is lost.",
+                "default": "10",
+                "env_var": "OPENVIKING_COMMIT_EVERY_N_TURNS",
+            },
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -446,8 +487,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
         self._user = os.environ.get("OPENVIKING_USER", "default")
         self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
+        try:
+            self._commit_every_n_turns = max(1, int(
+                os.environ.get("OPENVIKING_COMMIT_EVERY_N_TURNS", "10")
+            ))
+        except (ValueError, TypeError):
+            self._commit_every_n_turns = 10
         self._session_id = session_id
         self._turn_count = 0
+        self._uncommitted_count = 0
 
         try:
             self._client = _VikingClient(
@@ -493,15 +541,36 @@ class OpenVikingMemoryProvider(MemoryProvider):
             )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return prefetched results from the background thread."""
+        """Return prefetched results from the background thread.
+
+        Note ``query`` is intentionally unused: the cache was populated
+        by the previous turn's ``queue_prefetch`` call against THAT
+        turn's query.  Honest reporting of which query actually produced
+        the returned content lives in ``last_prefetch_query()``.
+        """
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+            # ``_prefetch_query`` stays set even after we clear
+            # ``_prefetch_result`` so observability code reading it
+            # post-prefetch still gets a truthful answer.
         if not result:
             return ""
         return f"## OpenViking Context\n{result}"
+
+    def last_prefetch_query(self) -> str:
+        """Return the query string that produced the most recent
+        cached prefetch result, or ``""`` if no prefetch has run yet.
+
+        Used by sparrow event logging to attribute the content of
+        ``memory_prefetch_receive`` to the query that ACTUALLY ran
+        against the search backend, rather than to the (unused) query
+        the current turn happened to ask about.
+        """
+        with self._prefetch_lock:
+            return self._prefetch_query
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire a background search to pre-load relevant context."""
@@ -528,9 +597,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         score = item.get("score", 0)
                         if abstract:
                             parts.append(f"- [{score:.2f}] {abstract} ({uri})")
-                if parts:
-                    with self._prefetch_lock:
+                # Always update _prefetch_query, even when ``parts`` is
+                # empty (no hits) — last_prefetch_query() must report
+                # what the search ACTUALLY ran with, including the empty
+                # case, so logs are honest about misses.
+                with self._prefetch_lock:
+                    self._prefetch_query = query
+                    if parts:
                         self._prefetch_result = "\n".join(parts)
+                    else:
+                        self._prefetch_result = ""
             except Exception as e:
                 logger.debug("OpenViking prefetch failed: %s", e)
 
@@ -540,11 +616,22 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Record the conversation turn in OpenViking's session (non-blocking)."""
+        """Record the conversation turn in OpenViking's session (non-blocking).
+
+        Posts the user + assistant messages on every turn, but only fires
+        ``/commit`` (which triggers OpenViking's memory extractor LLM —
+        the dominant per-turn cost) once every ``commit_every_n_turns``
+        turns.  ``flush()`` / ``on_session_end`` force a final commit on
+        gateway shutdown so no batched messages are lost.
+        """
         if not self._client:
             return
 
         self._turn_count += 1
+        self._uncommitted_count += 1
+        # Snapshot the decision so the worker thread doesn't race the
+        # next sync_turn() call mutating the counter mid-flight.
+        should_commit = self._uncommitted_count >= self._commit_every_n_turns
 
         def _sync():
             try:
@@ -564,8 +651,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "role": "assistant",
                     "content": assistant_content[:4000],
                 })
+                if should_commit:
+                    # Coordinate with flush() so we don't double-fire the
+                    # extractor (would re-process the same transcript and
+                    # double-bill the LLM round-trip).
+                    with self._commit_lock:
+                        client.post(f"/api/v1/sessions/{sid}/commit")
+                        self._uncommitted_count = 0
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed: %s", e)
+                self._notify_user(endpoint=self._endpoint, error=f"sync_turn: {e}")
 
         # Wait for any previous sync to finish before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
@@ -576,29 +671,46 @@ class OpenVikingMemoryProvider(MemoryProvider):
         )
         self._sync_thread.start()
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Commit the session to trigger memory extraction.
+    def flush(self) -> None:
+        """Force-commit any uncommitted batched turns, synchronously.
 
-        OpenViking automatically extracts 6 categories of memories:
-        profile, preferences, entities, events, cases, and patterns.
+        Drains the in-flight ``sync_turn`` worker first so any pending
+        message posts complete before we issue ``/commit`` — without
+        that wait, we'd trigger memory extraction over a transcript
+        that's missing the most recent user/assistant pair.
+
+        Idempotent and safe to call multiple times — the lock + counter
+        coordinate with ``sync_turn``'s own commit branch so the
+        extractor never fires twice for the same batch.
         """
         if not self._client:
             return
-
-        # Wait for any pending sync to finish first — do this before the
-        # turn_count check so the last turn's messages are flushed even if
-        # the count hasn't been incremented yet.
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=10.0)
+        with self._commit_lock:
+            if self._uncommitted_count <= 0:
+                return
+            try:
+                client = _VikingClient(
+                    self._endpoint, self._api_key,
+                    account=self._account, user=self._user, agent=self._agent,
+                )
+                client.post(f"/api/v1/sessions/{self._session_id}/commit")
+                self._uncommitted_count = 0
+            except Exception as e:
+                logger.warning("OpenViking flush commit failed: %s", e)
+                self._notify_user(endpoint=self._endpoint, error=f"flush: {e}")
 
-        if self._turn_count == 0:
-            return
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Force a final commit so any uncommitted batched turns survive
+        gateway shutdown / atexit / SIGINT.
 
-        try:
-            self._client.post(f"/api/v1/sessions/{self._session_id}/commit")
-            logger.info("OpenViking session %s committed (%d turns)", self._session_id, self._turn_count)
-        except Exception as e:
-            logger.warning("OpenViking session commit failed: %s", e)
+        DESIGN INVARIANT: be careful not to break this — without the
+        flush here, ``commit_every_n_turns > 1`` would silently drop
+        the trailing batch on Ctrl+C, losing message data the user
+        just sent.
+        """
+        self.flush()
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to OpenViking as explicit memories."""
@@ -621,6 +733,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 })
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
+                self._notify_user(endpoint=self._endpoint, error=f"memory mirror: {e}")
 
         t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
         t.start()
@@ -645,9 +758,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return self._tool_add_resource(args)
             return tool_error(f"Unknown tool: {tool_name}")
         except Exception as e:
+            self._notify_user(endpoint=self._endpoint, error=f"{tool_name}: {e}")
             return tool_error(str(e))
 
     def shutdown(self) -> None:
+        # Force a final commit BEFORE thread cleanup so any batched
+        # turns (commit_every_n_turns > 1) reach the extractor.  Without
+        # this, joining the sync thread would silently drop the trailing
+        # batch on planned shutdown paths.
+        try:
+            self.flush()
+        except Exception:
+            pass
         # Wait for background threads to finish
         for t in (self._sync_thread, self._prefetch_thread):
             if t and t.is_alive():
@@ -867,7 +989,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps({
             "status": "stored",
-            "message": "Memory recorded. Will be extracted and indexed on session commit.",
+            "message": "Memory recorded. Commit queues on next turn sync; extraction runs async.",
         })
 
     def _tool_add_resource(self, args: dict) -> str:

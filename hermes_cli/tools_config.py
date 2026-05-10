@@ -896,6 +896,9 @@ def _get_enabled_platforms() -> List[str]:
         enabled.append("whatsapp")
     if get_env_value("QQ_APP_ID"):
         enabled.append("qqbot")
+    napcat_enabled = str(get_env_value("NAPCAT_ENABLED") or "").strip().lower()
+    if napcat_enabled in ("1", "true", "yes", "on"):
+        enabled.append("onebot_napcat")
     return enabled
 
 
