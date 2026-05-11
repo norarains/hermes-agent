@@ -68,6 +68,12 @@ MESSAGE_KINDS: Dict[str, tuple] = {
     "stop_acknowledged": (),         # agent was running and was interrupted
     "stop_acknowledged_pending": (),  # agent hadn't actually started yet
     "stop_no_active_task": (),        # nothing was running
+    # Gateway lifecycle notifications, sent to active chats when the
+    # gateway is about to stop or restart.  Two kinds so operators can
+    # localize each precisely — restart adds resume guidance, shutdown
+    # does not.
+    "gateway_shutdown": (),
+    "gateway_restart": (),
 }
 
 
@@ -106,6 +112,11 @@ _DEFAULT_TEMPLATES: Dict[str, str] = {
         "⚡ Stopped. The agent hadn't started yet — you can continue this session."
     ),
     "stop_no_active_task": "No active task to stop.",
+    "gateway_shutdown": "⚠️ Gateway shutting down — Your current task will be interrupted.",
+    "gateway_restart": (
+        "⚠️ Gateway restarting — Your current task will be interrupted. "
+        "Send any message after restart and I'll try to resume where you left off."
+    ),
 }
 
 
