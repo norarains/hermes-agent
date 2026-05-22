@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.onebot_napcat import adapter as napcat_adapter_module
 from gateway.platforms.onebot_napcat.adapter import OneBotNapCatAdapter
 
 
@@ -11,6 +12,30 @@ def _adapter() -> OneBotNapCatAdapter:
     adapter.self_id = 1903883693
     adapter.self_name = "小麻雀"
     return adapter
+
+
+@pytest.mark.asyncio
+async def test_connect_terminates_spawned_napcat_when_ws_ready_fails(monkeypatch):
+    adapter = OneBotNapCatAdapter(PlatformConfig(enabled=True))
+    fake_proc = object()
+    fake_state = object()
+    spawn = AsyncMock(return_value=(fake_proc, fake_state))
+    wait_for_ws_ready = AsyncMock(
+        side_effect=napcat_adapter_module.spawner.NapCatSpawnError("login rejected")
+    )
+    terminate = AsyncMock()
+
+    monkeypatch.setattr(napcat_adapter_module.spawner, "spawn", spawn)
+    monkeypatch.setattr(napcat_adapter_module.spawner, "wait_for_ws_ready", wait_for_ws_ready)
+    monkeypatch.setattr(napcat_adapter_module.spawner, "terminate", terminate)
+
+    assert await adapter.connect() is False
+
+    spawn.assert_awaited_once()
+    wait_for_ws_ready.assert_awaited_once_with(adapter.ws_url, state=fake_state)
+    terminate.assert_awaited_once_with(fake_proc)
+    assert adapter._napcat_proc is None
+    assert adapter._napcat_state is None
 
 
 @pytest.mark.asyncio

@@ -429,6 +429,19 @@ class OneBotNapCatAdapter(BasePlatformAdapter):
                 # gateway console.
                 for line in str(exc).splitlines():
                     logger.error("NapCat: %s", line)
+                # DESIGN INVARIANT: be careful not to break this.
+                # Every successful autospawn must be paired with termination
+                # if startup fails before the adapter reaches connected
+                # state; otherwise reconnect attempts accumulate live QQ
+                # clients for the same account.
+                if self._napcat_proc is not None:
+                    try:
+                        await spawner.terminate(self._napcat_proc)
+                    except Exception:
+                        logger.exception("NapCat: failed to terminate process after startup error")
+                    finally:
+                        self._napcat_proc = None
+                        self._napcat_state = None
                 self._set_fatal_error("napcat_spawn", str(exc), retryable=False)
                 return False
 
