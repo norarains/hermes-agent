@@ -6480,6 +6480,37 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    @staticmethod
+    def _responses_null_output_iterable_error(exc: BaseException) -> bool:
+        """True when the OpenAI SDK trips over terminal response.output=None."""
+        text = str(exc)
+        return isinstance(exc, TypeError) and "NoneType" in text and "not iterable" in text
+
+    @staticmethod
+    def _codex_backfilled_response(output_items: list, text_parts: list, *, has_tool_calls: bool, model: str = None):
+        """Build a minimal Responses-like object from events already streamed."""
+        if output_items:
+            return SimpleNamespace(
+                output=list(output_items),
+                usage=None,
+                status="completed",
+                model=model,
+            )
+        if text_parts and not has_tool_calls:
+            assembled = "".join(text_parts)
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )],
+                usage=None,
+                status="completed",
+                model=model,
+            )
+        return None
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -6550,24 +6581,20 @@ class AIAgent:
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            final_response.output = list(collected_output_items)
+                    if _out is None or (isinstance(_out, list) and not _out):
+                        recovered = self._codex_backfilled_response(
+                            collected_output_items,
+                            self._codex_streamed_text_parts,
+                            has_tool_calls=has_tool_calls,
+                            model=api_kwargs.get("model"),
+                        )
+                        if recovered is not None:
+                            final_response.output = recovered.output
                             logger.debug(
-                                "Codex stream: backfilled %d output items from stream events",
+                                "Codex stream: backfilled missing output from stream events "
+                                "(items=%d, text_parts=%d)",
                                 len(collected_output_items),
-                            )
-                        elif self._codex_streamed_text_parts and not has_tool_calls:
-                            assembled = "".join(self._codex_streamed_text_parts)
-                            final_response.output = [SimpleNamespace(
-                                type="message",
-                                role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex stream: synthesized output from %d text deltas (%d chars)",
-                                len(self._codex_streamed_text_parts), len(assembled),
+                                len(self._codex_streamed_text_parts),
                             )
                     return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
@@ -6586,6 +6613,30 @@ class AIAgent:
                     exc,
                 )
                 return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            except TypeError as exc:
+                if self._responses_null_output_iterable_error(exc):
+                    recovered = self._codex_backfilled_response(
+                        collected_output_items,
+                        self._codex_streamed_text_parts,
+                        has_tool_calls=has_tool_calls,
+                        model=api_kwargs.get("model"),
+                    )
+                    if recovered is not None:
+                        logger.debug(
+                            "Codex Responses stream parser hit response.output=None; "
+                            "recovered from streamed events (items=%d, text_parts=%d). %s",
+                            len(collected_output_items),
+                            len(self._codex_streamed_text_parts),
+                            self._client_log_context(),
+                        )
+                        return recovered
+                    logger.debug(
+                        "Codex Responses stream parser hit response.output=None without "
+                        "recoverable events; falling back to create(stream=True). %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -6652,7 +6703,7 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(
