@@ -503,6 +503,37 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
+def _external_memory_text_view(value: Any) -> str:
+    """Return a plain string suitable for external memory providers."""
+    if isinstance(value, str):
+        return value
+    if _is_multimodal_tool_result(value):
+        return _multimodal_text_summary(value)
+    if isinstance(value, list):
+        parts = []
+        for part in value:
+            if isinstance(part, str):
+                if part:
+                    parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in {"text", "input_text", "output_text"}:
+                text = part.get("text")
+                if text:
+                    parts.append(str(text))
+            elif part_type in {"image", "image_url", "input_image"}:
+                parts.append("[image attachment]")
+            else:
+                text = part.get("text")
+                if text:
+                    parts.append(str(text))
+        if parts:
+            return "\n".join(parts)
+    return _multimodal_text_summary(value)
+
+
 def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
     """Mutate a multimodal tool-result envelope to append a subdir hint.
 
@@ -5294,6 +5325,11 @@ class AIAgent:
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
 
+        DESIGN INVARIANT: be careful not to break this. External memory
+        providers receive plain strings only; multimodal user messages must
+        be summarized before sync so provider APIs never see content lists or
+        raw image/base64 payloads.
+
         Interrupted turns are skipped entirely (#15218).  A partial
         assistant output, an aborted tool chain, or a mid-stream reset
         is not durable conversational truth — mirroring it into an
@@ -5313,13 +5349,17 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
+            memory_user_content = _external_memory_text_view(original_user_message)
+            memory_assistant_content = _external_memory_text_view(final_response)
+            if not (memory_user_content and memory_assistant_content):
+                return
             # Persist the completed exchange.  Prefetch is NOT fired
             # here anymore — it's fired at the START of each turn
             # against THAT turn's query (run_conversation, near the
             # beginning).  Firing here would queue against the prior
             # turn's query and produce the cross-turn-lag mismatch.
             self._memory_manager.sync_all(
-                original_user_message, final_response,
+                memory_user_content, memory_assistant_content,
                 session_id=self.session_id or "",
             )
         except Exception:

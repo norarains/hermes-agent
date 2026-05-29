@@ -51,3 +51,36 @@ def test_includes_configured_timezone_name(agent, monkeypatch):
 
     assert "Conversation started: Saturday, April 25, 2026 09:30 AM JST" in prompt
     assert "Timezone: Asia/Tokyo" in prompt
+
+
+def test_external_memory_sync_summarizes_multimodal_user_message():
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = MagicMock()
+    agent.session_id = "sess-image"
+    user_message = [
+        {
+            "type": "text",
+            "text": "User sent an image\n\n[Image attached at: /tmp/image.png]",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,RAW_IMAGE_BYTES"},
+        },
+    ]
+
+    agent._sync_external_memory_for_turn(
+        original_user_message=user_message,
+        final_response="Looks like release week.",
+        interrupted=False,
+    )
+
+    agent._memory_manager.sync_all.assert_called_once()
+    synced_user, synced_assistant = agent._memory_manager.sync_all.call_args.args[:2]
+    assert isinstance(synced_user, str)
+    assert synced_assistant == "Looks like release week."
+    assert "User sent an image" in synced_user
+    assert "[Image attached at: /tmp/image.png]" in synced_user
+    assert "[image attachment]" in synced_user
+    assert "data:image" not in synced_user
+    assert "RAW_IMAGE_BYTES" not in synced_user
+    assert agent._memory_manager.sync_all.call_args.kwargs == {"session_id": "sess-image"}
